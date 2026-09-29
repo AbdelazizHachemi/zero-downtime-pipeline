@@ -2,8 +2,6 @@
 
 Lint, test, Trivy, GHCR, a rolling deploy, smoke checks, and rollback for one NestJS API on Kubernetes.
 
-Architecture, the file map, and interview questions are in [docs/TECHNICAL.md](docs/TECHNICAL.md). The decisions are in [docs/adr](docs/adr).
-
 ## Pipeline
 
 Pull requests never touch the cluster. A green `ci` workflow on `main` is what starts `deploy`.
