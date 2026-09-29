@@ -1,0 +1,12 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: zdp
+resources:
+  - namespace.yaml
+  - postgres.yaml
+  - deployment.yaml
+  - service.yaml
+  - pdb.yaml
+images:
+  - name: 000000000000.dkr.ecr.us-east-1.localhost:4566/zero-downtime-pipeline
+    newTag: sha-REPLACE

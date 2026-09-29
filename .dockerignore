@@ -1,0 +1,11 @@
+.git
+.env
+**/.env
+**/node_modules
+**/dist
+docs
+.github
+k8s
+scripts
+*.md
+pipeline.pdf

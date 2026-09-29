@@ -1,0 +1,207 @@
+name: deploy
+
+on:
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: deploy or rollback
+        type: choice
+        required: true
+        default: deploy
+        options:
+          - deploy
+          - rollback
+
+concurrency:
+  group: zdp-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    if: >-
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') ||
+      (github.event_name == 'workflow_dispatch' && inputs.action == 'deploy')
+    runs-on: [self-hosted, k3d]
+    outputs:
+      sha: ${{ steps.meta.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - id: meta
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Start Floci
+        run: docker compose --profile floci pull floci && docker compose --profile floci up -d floci
+
+      - name: Wait for Floci
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -s -o /dev/null --max-time 2 http://127.0.0.1:4566; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Floci did not answer on port 4566" >&2
+          exit 1
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Ensure the ECR repository and log in
+        env:
+          AWS_ENDPOINT_URL: http://127.0.0.1:4566
+          AWS_DEFAULT_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+        run: |
+          aws ecr describe-repositories \
+            --repository-names zero-downtime-pipeline \
+            --endpoint-url "$AWS_ENDPOINT_URL" \
+            || aws ecr create-repository \
+              --repository-name zero-downtime-pipeline \
+              --endpoint-url "$AWS_ENDPOINT_URL"
+          aws ecr get-login-password --endpoint-url "$AWS_ENDPOINT_URL" \
+            | docker login --username AWS --password-stdin \
+              000000000000.dkr.ecr.us-east-1.localhost:4566
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          provenance: false
+          sbom: false
+          tags: |
+            ghcr.io/abdelazizhachemi/zero-downtime-pipeline:sha-${{ steps.meta.outputs.sha }}
+            ghcr.io/abdelazizhachemi/zero-downtime-pipeline:main
+            000000000000.dkr.ecr.us-east-1.localhost:4566/zero-downtime-pipeline:sha-${{ steps.meta.outputs.sha }}
+          build-args: |
+            GIT_SHA=${{ steps.meta.outputs.sha }}
+            BUILT_AT=${{ steps.meta.outputs.built_at }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Require the SHA tag in ECR
+        env:
+          AWS_ENDPOINT_URL: http://127.0.0.1:4566
+          AWS_DEFAULT_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+        run: |
+          aws ecr describe-images \
+            --repository-name zero-downtime-pipeline \
+            --image-ids imageTag=sha-${{ steps.meta.outputs.sha }} \
+            --endpoint-url "$AWS_ENDPOINT_URL"
+
+  image-scan:
+    needs: build
+    if: needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          scan-type: image
+          image-ref: ghcr.io/abdelazizhachemi/zero-downtime-pipeline:sha-${{ needs.build.outputs.sha }}
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+  deploy-staging:
+    needs: [build, image-scan]
+    if: needs.build.result == 'success' && needs.image-scan.result == 'success'
+    runs-on: [self-hosted, k3d]
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build.outputs.sha }}
+      - name: Import the pushed image into k3d
+        env:
+          SHA: ${{ needs.build.outputs.sha }}
+        run: |
+          ghcr="ghcr.io/abdelazizhachemi/zero-downtime-pipeline:sha-${SHA}"
+          ecr="000000000000.dkr.ecr.us-east-1.localhost:4566/zero-downtime-pipeline:sha-${SHA}"
+          if ! docker image inspect "$ecr" >/dev/null 2>&1; then
+            docker pull "$ghcr"
+            docker tag "$ghcr" "$ecr"
+          fi
+      - name: Roll out staging
+        env:
+          SHA: ${{ needs.build.outputs.sha }}
+        run: |
+          test -f .env || cp .env.example .env
+          make deploy SHA="$SHA"
+
+  smoke-staging:
+    needs: [build, deploy-staging]
+    if: needs.deploy-staging.result == 'success'
+    runs-on: [self-hosted, k3d]
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build.outputs.sha }}
+      - run: SMOKE_URL=http://127.0.0.1:8080 EXPECTED_SHA=${{ needs.build.outputs.sha }} ./scripts/smoke.sh
+
+  rollback:
+    needs: [deploy-staging, smoke-staging]
+    if: >-
+      always() && (
+        github.event.inputs.action == 'rollback' ||
+        needs.deploy-staging.result == 'failure' ||
+        needs.smoke-staging.result == 'failure'
+      )
+    runs-on: [self-hosted, k3d]
+    steps:
+      - uses: actions/checkout@v4
+      - id: undo
+        run: |
+          sha="$(SMOKE_URL=http://127.0.0.1:8080 ./scripts/rollback.sh | tail -n 1)"
+          echo "previous_sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Smoke the previous SHA
+        run: SMOKE_URL=http://127.0.0.1:8080 EXPECTED_SHA=${{ steps.undo.outputs.previous_sha }} ./scripts/smoke.sh
+
+  deploy-prod:
+    needs: [build, smoke-staging]
+    if: needs.smoke-staging.result == 'success' && github.event.inputs.action != 'rollback'
+    runs-on: [self-hosted, k3d]
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build.outputs.sha }}
+      - name: Roll out after the production approval
+        env:
+          SHA: ${{ needs.build.outputs.sha }}
+        run: |
+          test -f .env || cp .env.example .env
+          make deploy SHA="$SHA"
+
+  smoke-prod:
+    needs: [build, deploy-prod]
+    if: needs.deploy-prod.result == 'success'
+    runs-on: [self-hosted, k3d]
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build.outputs.sha }}
+      - run: SMOKE_URL=http://127.0.0.1:8080 EXPECTED_SHA=${{ needs.build.outputs.sha }} ./scripts/smoke.sh
